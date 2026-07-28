@@ -80,6 +80,17 @@ import {
 import { executeBestEffort, executeCritical, executeOptional } from "./utils/error-handlers.js";
 import { TimezoneFetcher } from "../timezone-fetcher.service.js";
 
+export function redactLaunchOptionsForLog<T extends Record<string, unknown>>(options: T): T {
+  if (!Object.prototype.hasOwnProperty.call(options, "userDataDir")) {
+    return { ...options };
+  }
+
+  return {
+    ...options,
+    userDataDir: "[redacted]",
+  };
+}
+
 export class CDPService extends EventEmitter {
   private logger: FastifyBaseLogger;
   private keepAlive: boolean;
@@ -110,7 +121,9 @@ export class CDPService extends EventEmitter {
   private proxyWebSocketHandler:
     | ((req: IncomingMessage, socket: Duplex, head: Buffer) => Promise<void>)
     | null = null;
-  private disconnectHandler: () => Promise<void> = () => this.endSession();
+  private sessionTerminationHandler:
+    | ((reason: ShutdownReason) => Promise<void>)
+    | null = null;
 
   constructor(
     config: { keepAlive?: boolean },
@@ -203,7 +216,13 @@ export class CDPService extends EventEmitter {
   }
 
   public setDisconnectHandler(handler: () => Promise<void>): void {
-    this.disconnectHandler = handler;
+    this.sessionTerminationHandler = async () => handler();
+  }
+
+  public setSessionTerminationHandler(
+    handler: (reason: ShutdownReason) => Promise<void>,
+  ): void {
+    this.sessionTerminationHandler = handler;
   }
 
   public getBrowserInstance(): Browser | null {
@@ -374,17 +393,7 @@ export class CDPService extends EventEmitter {
 
         await page.setRequestInterception(true);
 
-        page.on("request", (request) => this.handlePageRequest(request, page));
-
-        page.on("response", (response) => {
-          if (response.url().startsWith("file://")) {
-            this.logger.error(
-              `[CDPService] Blocked response from file protocol: ${response.url()}`,
-            );
-            page.close().catch(() => {});
-            this.endSession(ShutdownReason.SECURITY_VIOLATION);
-          }
-        });
+        this.wirePageEventHandlers(page);
       }
     } else if (target.type() === TargetType.BACKGROUND_PAGE) {
       this.logger.info(`[CDPService] Background page created: ${target.url()}`);
@@ -438,12 +447,32 @@ export class CDPService extends EventEmitter {
     }
 
     if (url.startsWith("file://")) {
-      this.logger.error(`[CDPService] Blocked request to file protocol: ${url}`);
-      page.close().catch(() => {});
-      this.endSession(ShutdownReason.SECURITY_VIOLATION);
+      this.logger.error("[CDPService] Blocked request from file protocol");
+      await page.close().catch(() => {});
+      await this.requestSessionTermination(ShutdownReason.SECURITY_VIOLATION);
     } else {
       await request.continue();
     }
+  }
+
+  private wirePageEventHandlers(page: Page): void {
+    page.on("request", (request) => {
+      void this.handlePageRequest(request, page).catch(() => {
+        this.logger.error("[CDPService] Request handling failed");
+      });
+    });
+
+    page.on("response", (response) => {
+      if (response.url().startsWith("file://")) {
+        this.logger.error("[CDPService] Blocked response from file protocol");
+        void page.close().catch(() => {});
+        void this.requestSessionTermination(ShutdownReason.SECURITY_VIOLATION).catch(() => {
+          this.logger.error(
+            "[CDPService] Session termination failed after a security violation",
+          );
+        });
+      }
+    });
   }
 
   public async createPage(): Promise<Page> {
@@ -481,7 +510,7 @@ export class CDPService extends EventEmitter {
         await FileService.getInstance().cleanupFiles();
         this.logger.info("[CDPService] Files cleaned successfully");
       } catch (error) {
-        this.logger.error(`[CDPService] Error cleaning files during shutdown: ${error}`);
+        this.logger.error("[CDPService] Error cleaning files during shutdown");
       }
 
       this.fingerprintData = null;
@@ -491,7 +520,7 @@ export class CDPService extends EventEmitter {
       this.emit("close");
       this.shuttingDown = false;
     } catch (error) {
-      this.logger.error(`[CDPService] Error during shutdown: ${error}`);
+      this.logger.error("[CDPService] Error during shutdown");
       // Ensure we complete the shutdown even if plugins throw errors
       await this.browserInstance?.close();
       await this.browserInstance?.process()?.kill();
@@ -500,9 +529,7 @@ export class CDPService extends EventEmitter {
       try {
         await FileService.getInstance().cleanupFiles();
       } catch (cleanupError) {
-        this.logger.error(
-          `[CDPService] Error cleaning files during error recovery: ${cleanupError}`,
-        );
+        this.logger.error("[CDPService] Error cleaning files during error recovery");
       }
 
       this.browserInstance = null;
@@ -919,10 +946,10 @@ export class CDPService extends EventEmitter {
         };
 
         this.logger.info(`[CDPService] Launch Options:`);
-        this.logger.info(JSON.stringify(finalLaunchOptions, null, 2));
+        this.logger.info(JSON.stringify(redactLaunchOptionsForLog(finalLaunchOptions), null, 2));
 
         if (userDataDir && this.launchConfig.userPreferences) {
-          this.logger.info(`[CDPService] Setting up user preferences in ${userDataDir}`);
+          this.logger.info("[CDPService] Setting up user preferences");
           await executeBestEffort(
             this.logger,
             async () => this.setupUserPreferences(userDataDir, this.launchConfig!.userPreferences!),
@@ -1017,13 +1044,11 @@ export class CDPService extends EventEmitter {
           "Failed to configure download behavior",
         );
 
-        this.browserInstance.on("targetcreated", this.handleNewTarget.bind(this));
-        this.browserInstance.on("targetchanged", this.handleTargetChange.bind(this));
+        this.wireBrowserEventHandlers(this.browserInstance);
         this.browserInstance.on("targetdestroyed", (target) => {
           const targetId = (target as any)._targetId;
           this.targetInstrumentationManager.detach(targetId);
         });
-        this.browserInstance.on("disconnected", this.onDisconnect.bind(this));
 
         this.wsEndpoint = await executeCritical(
           async () => this.browserInstance!.wsEndpoint(),
@@ -1196,7 +1221,7 @@ export class CDPService extends EventEmitter {
     }
 
     try {
-      this.logger.info(`[CDPService] Dumping session data from userDataDir: ${userDataDir}`);
+      this.logger.info("[CDPService] Dumping session data");
 
       // Run session data extraction and CDP storage extraction in parallel
       const [cookieData, sessionData, storageData] = await Promise.all([
@@ -1225,8 +1250,7 @@ export class CDPService extends EventEmitter {
       this.logger.info("[CDPService] Session data dumped successfully");
       return result;
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      this.logger.error(`[CDPService] Error dumping session data: ${errorMessage}`);
+      this.logger.error("[CDPService] Error dumping session data");
       return {};
     }
   }
@@ -1330,35 +1354,72 @@ export class CDPService extends EventEmitter {
     }
   }
 
-  @traceable
-  public async endSession(reason: ShutdownReason = ShutdownReason.SESSION_END): Promise<void> {
+  public async launchIdle(userDataDir: string): Promise<Browser> {
+    return this.launch({
+      ...this.defaultLaunchConfig,
+      userDataDir,
+    });
+  }
+
+  public async captureSessionContext(): Promise<void> {
+    this.sessionContext = await this.getBrowserState();
+  }
+
+  public async shutdownSession(
+    reason: ShutdownReason = ShutdownReason.SESSION_END,
+  ): Promise<void> {
     this.logger.info("Ending current session and resetting to default configuration.");
-    const sessionConfig = this.currentSessionConfig!;
+    const sessionConfig = this.currentSessionConfig ?? this.defaultLaunchConfig;
+    let firstError: unknown = null;
 
-    this.sessionContext = await this.getBrowserState().catch(() => null);
+    const attempt = async (operation: () => Promise<void>): Promise<void> => {
+      try {
+        await operation();
+      } catch (error) {
+        firstError ??= error;
+      }
+    };
 
-    try {
-      await this.pluginManager.onBeforeSessionEnd(sessionConfig);
-      await this.shutdown(reason);
-      await this.pluginManager.onSessionEnd(sessionConfig);
-      this.currentSessionConfig = null;
-      this.sessionContext = null;
-      this.trackedOrigins.clear();
+    await attempt(() => this.pluginManager.onBeforeSessionEnd(sessionConfig));
+    await attempt(() => this.shutdown(reason));
+    await attempt(() => this.pluginManager.onSessionEnd(sessionConfig));
 
-      this.instrumentationLogger.resetContext();
+    this.currentSessionConfig = null;
+    this.sessionContext = null;
+    this.trackedOrigins.clear();
+    this.instrumentationLogger.resetContext();
+    this.targetInstrumentationManager = new TargetInstrumentationManager(
+      this.instrumentationLogger,
+      this.logger,
+    );
 
-      // Reset target instrumentation manager to clear session-specific options
-      // (e.g. dangerous logging flags) so they don't leak into the idle browser
-      this.targetInstrumentationManager = new TargetInstrumentationManager(
-        this.instrumentationLogger,
-        this.logger,
-      );
-    } finally {
-      await this.pluginManager.onAfterSessionEnd(sessionConfig);
+    await attempt(() => this.pluginManager.onAfterSessionEnd(sessionConfig));
+
+    if (firstError) {
+      throw firstError;
+    }
+  }
+
+  @traceable
+  public async endSession(
+    reason: ShutdownReason = ShutdownReason.SESSION_END,
+    idleUserDataDir?: string,
+  ): Promise<void> {
+    if (!idleUserDataDir) {
+      throw new Error("owned idle profile directory is required");
     }
 
-    // Relaunch the idle browser
-    await this.launch(this.defaultLaunchConfig);
+    await this.captureSessionContext();
+    await this.shutdownSession(reason);
+    await this.launchIdle(idleUserDataDir);
+  }
+
+  private wireBrowserEventHandlers(browser: Browser): void {
+    browser.on("targetcreated", this.handleNewTarget.bind(this));
+    browser.on("targetchanged", this.handleTargetChange.bind(this));
+    browser.on("disconnected", () => {
+      void this.onDisconnect();
+    });
   }
 
   private async onDisconnect(): Promise<void> {
@@ -1368,7 +1429,27 @@ export class CDPService extends EventEmitter {
       return;
     }
 
-    await this.disconnectHandler();
+    try {
+      if (!this.sessionTerminationHandler) {
+        this.logger.error(
+          "[CDPService] Browser disconnected before session termination handler was configured",
+        );
+        await this.shutdown(ShutdownReason.BROWSER_DISCONNECT);
+        return;
+      }
+
+      await this.requestSessionTermination(ShutdownReason.BROWSER_DISCONNECT);
+    } catch (error) {
+      this.logger.error("[CDPService] Session termination failed after browser disconnect");
+    }
+  }
+
+  private async requestSessionTermination(reason: ShutdownReason): Promise<void> {
+    if (!this.sessionTerminationHandler) {
+      throw new Error("session termination handler is not configured");
+    }
+
+    await this.sessionTerminationHandler(reason);
   }
 
   @traceable
@@ -1543,16 +1624,16 @@ export class CDPService extends EventEmitter {
         const existingContent = await fs.promises.readFile(preferencesPath, "utf8");
         existingPreferences = JSON.parse(existingContent);
       } catch (error) {
-        this.logger.debug(`[CDPService] No existing preferences found, creating new: ${error}`);
+        this.logger.debug("[CDPService] No existing preferences found, creating new");
       }
 
       const mergedPreferences = deepMerge(existingPreferences, userPreferences);
 
       await fs.promises.writeFile(preferencesPath, JSON.stringify(mergedPreferences, null, 2));
 
-      this.logger.info(`[CDPService] User preferences written to ${preferencesPath}`);
+      this.logger.info("[CDPService] User preferences written");
     } catch (error) {
-      this.logger.error(`[CDPService] Error setting up user preferences: ${error}`);
+      this.logger.error("[CDPService] Error setting up user preferences");
       throw error;
     }
   }

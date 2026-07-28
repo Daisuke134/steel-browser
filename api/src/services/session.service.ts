@@ -1,5 +1,5 @@
 import { FastifyBaseLogger } from "fastify";
-import { mkdir } from "fs/promises";
+import { mkdir, mkdtemp, rm } from "fs/promises";
 import os from "os";
 import path, { dirname } from "path";
 import { fileURLToPath } from "url";
@@ -65,6 +65,9 @@ export class SessionService {
 
   public pastSessions: Session[] = [];
   public activeSession: Session;
+  private ownedSessionProfileDir: string | null = null;
+  private ownedIdleProfileDir: string | null = null;
+  private releasePromise: Promise<SessionDetails> | null = null;
 
   constructor(config: {
     cdpService: CDPService;
@@ -77,6 +80,9 @@ export class SessionService {
     this.fileService = config.fileService;
     this.logger = config.logger;
     this.timezoneFetcher = new TimezoneFetcher(config.logger);
+    this.cdpService.setSessionTerminationHandler(async (reason) => {
+      await this.endSession(reason);
+    });
     this.activeSession = {
       id: uuidv4(),
       createdAt: new Date().toISOString(),
@@ -177,12 +183,6 @@ export class SessionService {
       deviceConfig,
     });
 
-    const userDataDir =
-      options.userDataDir || options.persist === true
-        ? path.join(dirname(fileURLToPath(import.meta.url)), "..", "..", "user-data-dir")
-        : env.CHROME_USER_DATA_DIR || path.join(os.tmpdir(), "steel-chrome");
-    await mkdir(userDataDir, { recursive: true });
-
     const defaultUserPreferences = {
       plugins: {
         always_open_pdf_externally: true,
@@ -214,68 +214,119 @@ export class SessionService {
       await this.activeSession.proxyServer.listen();
     }
 
-    const browserLauncherOptions: BrowserLauncherOptions = {
-      options: {
-        headless: headless ?? env.CHROME_HEADLESS,
-        proxyUrl: this.activeSession.proxyServer?.url,
-      },
-      sessionContext,
-      userAgent,
-      blockAds,
-      fingerprint,
-      optimizeBandwidth: normalizedOptimize,
-      extensions: extensions || [],
-      logSinkUrl,
-      timezone: timezonePromise,
-      dimensions: finalDimensions,
-      userDataDir,
-      userPreferences: mergedUserPreferences,
-      extra,
-      credentials,
-      skipFingerprintInjection,
-      deviceConfig,
-      fullscreen,
-      dangerouslyLogRequestDetails,
-      captureWorkerNetwork,
-      caCertificates,
-    };
+    let ownedSessionProfileDir: string | null = null;
+    const previousOwnedIdleProfileDir = this.ownedIdleProfileDir;
+    try {
+      const explicitUserDataDir =
+        typeof options.userDataDir === "string" && options.userDataDir.trim()
+          ? options.userDataDir
+          : null;
+      ownedSessionProfileDir =
+        explicitUserDataDir || options.persist === true
+          ? null
+          : await this.createOwnedProfile("steel-session-");
+      const userDataDir =
+        explicitUserDataDir ||
+        (options.persist === true
+          ? path.join(dirname(fileURLToPath(import.meta.url)), "..", "..", "user-data-dir")
+          : ownedSessionProfileDir!);
+      await mkdir(userDataDir, { recursive: true });
 
-    if (isSelenium) {
-      await this.cdpService.shutdown(ShutdownReason.MODE_SWITCH);
-      await this.seleniumService.launch(browserLauncherOptions);
-
-      Object.assign(this.activeSession, {
-        websocketUrl: "",
-        debugUrl: "",
-        sessionViewerUrl: "",
-        userAgent:
-          userAgent ||
-          "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-        dimensions: this.cdpService.getDimensions(),
+      const browserLauncherOptions: BrowserLauncherOptions = {
+        options: {
+          headless: headless ?? env.CHROME_HEADLESS,
+          proxyUrl: this.activeSession.proxyServer?.url,
+        },
+        sessionContext,
+        userAgent,
+        blockAds,
+        fingerprint,
+        optimizeBandwidth: normalizedOptimize,
+        extensions: extensions || [],
+        logSinkUrl,
+        timezone: timezonePromise,
+        dimensions: finalDimensions,
+        userDataDir,
+        userPreferences: mergedUserPreferences,
+        extra,
+        credentials,
+        skipFingerprintInjection,
         deviceConfig,
-      });
+        fullscreen,
+        dangerouslyLogRequestDetails,
+        captureWorkerNetwork,
+        caCertificates,
+      };
 
+      if (isSelenium) {
+        await this.cdpService.shutdown(ShutdownReason.MODE_SWITCH);
+        await this.seleniumService.launch(browserLauncherOptions);
+
+        Object.assign(this.activeSession, {
+          websocketUrl: "",
+          debugUrl: "",
+          sessionViewerUrl: "",
+          userAgent:
+            userAgent ||
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+          dimensions: this.cdpService.getDimensions(),
+          deviceConfig,
+        });
+      } else {
+        await this.cdpService.startNewSession(browserLauncherOptions);
+
+        Object.assign(this.activeSession, {
+          websocketUrl: getBaseUrl("ws"),
+          debugUrl: getUrl("v1/sessions/debug"),
+          debuggerUrl: getUrl("v1/devtools/inspector.html"),
+          sessionViewerUrl: getBaseUrl(),
+          userAgent:
+            this.cdpService.getUserAgent() ||
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+          dimensions: this.cdpService.getDimensions(),
+          deviceConfig,
+        });
+      }
+
+      if (previousOwnedIdleProfileDir) {
+        await this.removeOwnedProfile(previousOwnedIdleProfileDir);
+      }
+      this.ownedIdleProfileDir = null;
+      this.ownedSessionProfileDir = ownedSessionProfileDir;
       return this.activeSession;
-    } else {
-      await this.cdpService.startNewSession(browserLauncherOptions);
-
-      Object.assign(this.activeSession, {
-        websocketUrl: getBaseUrl("ws"),
-        debugUrl: getUrl("v1/sessions/debug"),
-        debuggerUrl: getUrl("v1/devtools/inspector.html"),
-        sessionViewerUrl: getBaseUrl(),
-        userAgent:
-          this.cdpService.getUserAgent() ||
-          "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-        dimensions: this.cdpService.getDimensions(),
-        deviceConfig,
+    } catch (error) {
+      await this.cdpService.shutdown(ShutdownReason.LAUNCH_FAILURE).catch(() => {});
+      this.ownedSessionProfileDir = null;
+      this.ownedIdleProfileDir = null;
+      await this.removeOwnedProfiles([
+        ownedSessionProfileDir,
+        previousOwnedIdleProfileDir,
+      ]).catch((cleanupError) => {
+        this.logger.error("Failed to remove owned browser profiles");
       });
+      throw error;
     }
-
-    return this.activeSession;
   }
 
-  public async endSession(): Promise<SessionDetails> {
+  public async endSession(
+    reason: ShutdownReason = ShutdownReason.SESSION_END,
+  ): Promise<SessionDetails> {
+    if (this.releasePromise) {
+      return this.releasePromise;
+    }
+
+    const releasePromise = this.releaseSession(reason);
+    this.releasePromise = releasePromise;
+    try {
+      return await releasePromise;
+    } finally {
+      if (this.releasePromise === releasePromise) {
+        this.releasePromise = null;
+      }
+    }
+  }
+
+  private async releaseSession(reason: ShutdownReason): Promise<SessionDetails> {
     this.activeSession.complete();
     this.activeSession.status = "released";
     this.activeSession.duration =
@@ -286,11 +337,51 @@ export class SessionService {
       this.activeSession.proxyRxBytes = this.activeSession.proxyServer.rxBytes;
     }
 
+    const ownedSessionProfileDir = this.ownedSessionProfileDir;
+    const previousOwnedIdleProfileDir = this.ownedIdleProfileDir;
+    this.ownedSessionProfileDir = null;
+    this.ownedIdleProfileDir = null;
+
+    let releaseError: unknown = null;
+    const attemptReleaseStep = async (operation: () => Promise<void>): Promise<void> => {
+      try {
+        await operation();
+      } catch (error) {
+        releaseError ??= error;
+      }
+    };
+
     if (this.activeSession.isSelenium) {
-      this.seleniumService.close();
-      await this.cdpService.launch();
+      await attemptReleaseStep(async () => {
+        await Promise.resolve(this.seleniumService.close());
+      });
     } else {
-      await this.cdpService.endSession();
+      await attemptReleaseStep(() => this.cdpService.captureSessionContext());
+      await attemptReleaseStep(() =>
+        this.cdpService.shutdownSession(reason),
+      );
+    }
+
+    await attemptReleaseStep(() =>
+      this.removeOwnedProfiles([ownedSessionProfileDir, previousOwnedIdleProfileDir]),
+    );
+
+    if (releaseError) {
+      throw releaseError;
+    }
+
+    let idleProfileDir: string | null = null;
+    try {
+      idleProfileDir = await this.createOwnedProfile("steel-idle-");
+      await this.cdpService.launchIdle(idleProfileDir);
+      this.ownedIdleProfileDir = idleProfileDir;
+    } catch (error) {
+      await this.cdpService.shutdown(ShutdownReason.LAUNCH_FAILURE).catch(() => {});
+      this.ownedIdleProfileDir = null;
+      await this.removeOwnedProfiles([idleProfileDir]).catch((cleanupError) => {
+        this.logger.error("Failed to remove owned idle browser profile");
+      });
+      throw error;
     }
 
     const releasedSession = this.activeSession;
@@ -329,5 +420,38 @@ export class SessionService {
 
   public setProxyFactory(factory: ProxyFactory) {
     this.proxyFactory = factory;
+  }
+
+  private createOwnedProfile(prefix: "steel-session-" | "steel-idle-"): Promise<string> {
+    return mkdtemp(path.join(os.tmpdir(), prefix));
+  }
+
+  private async removeOwnedProfile(profileDir: string): Promise<void> {
+    try {
+      await rm(profileDir, {
+        force: true,
+        maxRetries: 3,
+        recursive: true,
+        retryDelay: 100,
+      });
+    } catch (error) {
+      throw new Error("ephemeral browser profile cleanup failed");
+    }
+  }
+
+  private async removeOwnedProfiles(profileDirs: Array<string | null>): Promise<void> {
+    let firstError: unknown = null;
+
+    for (const profileDir of new Set(profileDirs.filter((value): value is string => !!value))) {
+      try {
+        await this.removeOwnedProfile(profileDir);
+      } catch (error) {
+        firstError ??= error;
+      }
+    }
+
+    if (firstError) {
+      throw firstError;
+    }
   }
 }

@@ -29,7 +29,7 @@ export class ChromeContextService extends EventEmitter {
       };
     }
 
-    this.logger.info(`Extracting session data from Chrome user data directory: ${userDataDir}`);
+    this.logger.info("Extracting session data from Chrome profile");
 
     try {
       const sessionData: SessionData = {};
@@ -49,9 +49,8 @@ export class ChromeContextService extends EventEmitter {
 
       return sessionData;
     } catch (error: unknown) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      this.logger.error(`Error extracting session data: ${errorMessage}`);
-      throw new Error(`Failed to extract session data: ${errorMessage}`);
+      this.logger.error("Error extracting session data");
+      throw new Error("Failed to extract session data");
     }
   }
 
@@ -62,14 +61,12 @@ export class ChromeContextService extends EventEmitter {
     userDataDir: string,
   ): Promise<Record<string, Record<string, string>>> {
     const localStoragePath = getProfilePath(userDataDir, "Local Storage", "leveldb");
-    this.logger.info(`Extracting localStorage from ${localStoragePath}`);
+    this.logger.info("Extracting localStorage from Chrome profile");
 
     try {
-      this.logger.info(`Reading localStorage from ${localStoragePath}`);
       return await ChromeLocalStorageReader.readLocalStorage(localStoragePath);
     } catch (error: unknown) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      this.logger.error(`Error extracting localStorage: ${errorMessage}`);
+      this.logger.error("Error extracting localStorage");
       return {};
     }
   }
@@ -84,13 +81,12 @@ export class ChromeContextService extends EventEmitter {
     const sessionStoragePath = getProfilePath(userDataDir, "Session Storage");
 
     try {
-      this.logger.info(`Reading sessionStorage from ${sessionStoragePath}`);
+      this.logger.info("Extracting sessionStorage from Chrome profile");
       const sessionStorage =
         await ChromeSessionStorageReader.readSessionStorage(sessionStoragePath);
       return sessionStorage;
     } catch (error: unknown) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      this.logger.error(`Error extracting sessionStorage: ${errorMessage}`);
+      this.logger.error("Error extracting sessionStorage");
       return {};
     }
   }
