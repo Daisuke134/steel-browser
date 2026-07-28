@@ -11,9 +11,7 @@ const profileFs = vi.hoisted(() => ({
 vi.mock("fs/promises", () => profileFs);
 
 const logger: any = {
-  child: vi.fn(function () {
-    return this;
-  }),
+  child: vi.fn(() => logger),
   debug: vi.fn(),
   error: vi.fn(),
   info: vi.fn(),
@@ -39,12 +37,13 @@ function createHarness() {
     fileService: {} as any,
     logger,
   });
-  const start = (sessionContext?: any) =>
+  const start = (sessionContext?: any, overrides: Record<string, any> = {}) =>
     service.startSession({
       blockAds: true,
       credentials: {} as any,
       sessionContext,
       timezone: "UTC",
+      ...overrides,
     });
   return { cdpService, service, start };
 }
@@ -52,6 +51,8 @@ function createHarness() {
 describe("implicit session profile isolation", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    profileFs.mkdtemp.mockReset();
+    profileFs.rm.mockReset().mockResolvedValue(undefined);
     profileFs.mkdtemp
       .mockResolvedValueOnce("/tmp/steel-session-a")
       .mockResolvedValueOnce("/tmp/steel-idle-a")
@@ -101,10 +102,10 @@ describe("implicit session profile isolation", () => {
     await start();
     await service.endSession();
 
-    expect(profileFs.rm).toHaveBeenCalledWith("/tmp/steel-session-a", {
-      force: true,
-      recursive: true,
-    });
+    expect(profileFs.rm).toHaveBeenCalledWith(
+      "/tmp/steel-session-a",
+      expect.objectContaining({ force: true, recursive: true }),
+    );
   });
 
   it("deletes an auto-owned profile when browser launch fails", async () => {
@@ -112,10 +113,10 @@ describe("implicit session profile isolation", () => {
     cdpService.startNewSession.mockRejectedValueOnce(new Error("launch failed"));
 
     await expect(start()).rejects.toThrow("launch failed");
-    expect(profileFs.rm).toHaveBeenCalledWith("/tmp/steel-session-a", {
-      force: true,
-      recursive: true,
-    });
+    expect(profileFs.rm).toHaveBeenCalledWith(
+      "/tmp/steel-session-a",
+      expect.objectContaining({ force: true, recursive: true }),
+    );
   });
 
   it("relaunches the idle browser on a different auto-owned directory", async () => {
@@ -129,5 +130,45 @@ describe("implicit session profile isolation", () => {
       "/tmp/steel-idle-a",
     );
     expect("/tmp/steel-idle-a").not.toBe("/tmp/steel-session-a");
+  });
+
+  it("bounds recursive cleanup retries", async () => {
+    const { service, start } = createHarness();
+
+    await start();
+    await service.endSession();
+
+    expect(profileFs.rm).toHaveBeenCalledWith("/tmp/steel-session-a", {
+      force: true,
+      maxRetries: 3,
+      recursive: true,
+      retryDelay: 100,
+    });
+  });
+
+  it("does not own or delete an explicit userDataDir", async () => {
+    const { cdpService, service, start } = createHarness();
+
+    await start(undefined, { userDataDir: "/profiles/caller-owned" });
+    await service.endSession();
+
+    expect(cdpService.startNewSession.mock.calls[0][0].userDataDir).toBe(
+      "/profiles/caller-owned",
+    );
+    expect(profileFs.rm).not.toHaveBeenCalledWith(
+      "/profiles/caller-owned",
+      expect.anything(),
+    );
+  });
+
+  it("preserves persist as a non-owned profile", async () => {
+    const { cdpService, service, start } = createHarness();
+
+    await start(undefined, { persist: true });
+    const profile = cdpService.startNewSession.mock.calls[0][0].userDataDir;
+    await service.endSession();
+
+    expect(profile).toContain("user-data-dir");
+    expect(profileFs.rm).not.toHaveBeenCalledWith(profile, expect.anything());
   });
 });

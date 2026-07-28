@@ -1330,8 +1330,18 @@ export class CDPService extends EventEmitter {
     }
   }
 
+  public async launchIdle(userDataDir: string): Promise<Browser> {
+    return this.launch({
+      ...this.defaultLaunchConfig,
+      userDataDir,
+    });
+  }
+
   @traceable
-  public async endSession(reason: ShutdownReason = ShutdownReason.SESSION_END): Promise<void> {
+  public async endSession(
+    reason: ShutdownReason = ShutdownReason.SESSION_END,
+    idleUserDataDir?: string,
+  ): Promise<void> {
     this.logger.info("Ending current session and resetting to default configuration.");
     const sessionConfig = this.currentSessionConfig!;
 
@@ -1358,7 +1368,11 @@ export class CDPService extends EventEmitter {
     }
 
     // Relaunch the idle browser
-    await this.launch(this.defaultLaunchConfig);
+    await this.launch(
+      idleUserDataDir
+        ? { ...this.defaultLaunchConfig, userDataDir: idleUserDataDir }
+        : this.defaultLaunchConfig,
+    );
   }
 
   private async onDisconnect(): Promise<void> {
