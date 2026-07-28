@@ -393,19 +393,7 @@ export class CDPService extends EventEmitter {
 
         await page.setRequestInterception(true);
 
-        page.on("request", (request) => this.handlePageRequest(request, page));
-
-        page.on("response", (response) => {
-          if (response.url().startsWith("file://")) {
-            this.logger.error("[CDPService] Blocked response from file protocol");
-            page.close().catch(() => {});
-            void this.requestSessionTermination(ShutdownReason.SECURITY_VIOLATION).catch(() => {
-              this.logger.error(
-                "[CDPService] Session termination failed after a security violation",
-              );
-            });
-          }
-        });
+        this.wirePageEventHandlers(page);
       }
     } else if (target.type() === TargetType.BACKGROUND_PAGE) {
       this.logger.info(`[CDPService] Background page created: ${target.url()}`);
@@ -467,6 +455,26 @@ export class CDPService extends EventEmitter {
     }
   }
 
+  private wirePageEventHandlers(page: Page): void {
+    page.on("request", (request) => {
+      void this.handlePageRequest(request, page).catch(() => {
+        this.logger.error("[CDPService] Request handling failed");
+      });
+    });
+
+    page.on("response", (response) => {
+      if (response.url().startsWith("file://")) {
+        this.logger.error("[CDPService] Blocked response from file protocol");
+        void page.close().catch(() => {});
+        void this.requestSessionTermination(ShutdownReason.SECURITY_VIOLATION).catch(() => {
+          this.logger.error(
+            "[CDPService] Session termination failed after a security violation",
+          );
+        });
+      }
+    });
+  }
+
   public async createPage(): Promise<Page> {
     if (!this.browserInstance) {
       throw new Error("Browser instance not initialized");
@@ -502,7 +510,7 @@ export class CDPService extends EventEmitter {
         await FileService.getInstance().cleanupFiles();
         this.logger.info("[CDPService] Files cleaned successfully");
       } catch (error) {
-        this.logger.error(`[CDPService] Error cleaning files during shutdown: ${error}`);
+        this.logger.error("[CDPService] Error cleaning files during shutdown");
       }
 
       this.fingerprintData = null;
@@ -512,7 +520,7 @@ export class CDPService extends EventEmitter {
       this.emit("close");
       this.shuttingDown = false;
     } catch (error) {
-      this.logger.error(`[CDPService] Error during shutdown: ${error}`);
+      this.logger.error("[CDPService] Error during shutdown");
       // Ensure we complete the shutdown even if plugins throw errors
       await this.browserInstance?.close();
       await this.browserInstance?.process()?.kill();
@@ -521,9 +529,7 @@ export class CDPService extends EventEmitter {
       try {
         await FileService.getInstance().cleanupFiles();
       } catch (cleanupError) {
-        this.logger.error(
-          `[CDPService] Error cleaning files during error recovery: ${cleanupError}`,
-        );
+        this.logger.error("[CDPService] Error cleaning files during error recovery");
       }
 
       this.browserInstance = null;
@@ -1038,13 +1044,11 @@ export class CDPService extends EventEmitter {
           "Failed to configure download behavior",
         );
 
-        this.browserInstance.on("targetcreated", this.handleNewTarget.bind(this));
-        this.browserInstance.on("targetchanged", this.handleTargetChange.bind(this));
+        this.wireBrowserEventHandlers(this.browserInstance);
         this.browserInstance.on("targetdestroyed", (target) => {
           const targetId = (target as any)._targetId;
           this.targetInstrumentationManager.detach(targetId);
         });
-        this.browserInstance.on("disconnected", this.onDisconnect.bind(this));
 
         this.wsEndpoint = await executeCritical(
           async () => this.browserInstance!.wsEndpoint(),
@@ -1410,6 +1414,14 @@ export class CDPService extends EventEmitter {
     await this.launchIdle(idleUserDataDir);
   }
 
+  private wireBrowserEventHandlers(browser: Browser): void {
+    browser.on("targetcreated", this.handleNewTarget.bind(this));
+    browser.on("targetchanged", this.handleTargetChange.bind(this));
+    browser.on("disconnected", () => {
+      void this.onDisconnect();
+    });
+  }
+
   private async onDisconnect(): Promise<void> {
     this.logger.info("Browser disconnected. Handling cleanup.");
 
@@ -1417,7 +1429,19 @@ export class CDPService extends EventEmitter {
       return;
     }
 
-    await this.requestSessionTermination(ShutdownReason.BROWSER_DISCONNECT);
+    try {
+      if (!this.sessionTerminationHandler) {
+        this.logger.error(
+          "[CDPService] Browser disconnected before session termination handler was configured",
+        );
+        await this.shutdown(ShutdownReason.BROWSER_DISCONNECT);
+        return;
+      }
+
+      await this.requestSessionTermination(ShutdownReason.BROWSER_DISCONNECT);
+    } catch (error) {
+      this.logger.error("[CDPService] Session termination failed after browser disconnect");
+    }
   }
 
   private async requestSessionTermination(reason: ShutdownReason): Promise<void> {

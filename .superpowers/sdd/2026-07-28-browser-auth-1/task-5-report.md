@@ -155,3 +155,104 @@ exit 0
 ### Gate state and concerns
 
 The scoped Steel code, API tests, and TypeScript build pass. No image build, deployment, production/provider browser action, or local browser/Mac-loop action was performed. Live container lifecycle behavior and the production continuity proof remain outside this fork gate and must be verified by the parent Task 5 workflow.
+
+---
+
+## Fix round 5/5 — real event wiring, fail-closed disconnect, and complete path-log bounds
+
+### Root cause evidence
+
+| Finding | Reproduced root cause | Decision |
+|---|---|---|
+| Real Chrome extraction logs | `ChromeContextService` interpolated `userDataDir`, derived LevelDB/session-storage paths, and reader exception messages | Keep paths only as reader inputs; use fixed bounded lifecycle logs and fixed outward extraction errors |
+| Plugin/shutdown logs | `PluginManager` and `CDPService.shutdown()` interpolated caught `Error` values, allowing a profile path in the message/cause chain to reach logs | Preserve hook/plugin identity and shutdown stage, but never log caught exception objects/messages |
+| Request/response/disconnect lifecycle proof | Round 4 called private handlers directly and replaced capture/shutdown with event-array stubs | Extract the production listener registration into `wirePageEventHandlers` / `wireBrowserEventHandlers`; test emitted events through those exact listeners while keeping real `ChromeContextService`, `captureSessionContext`, `shutdownSession`, and `launchIdle` |
+| Pre-handler disconnect rejection | Puppeteer `Browser` is an `EventEmitter`; the async `disconnected` listener rejected when no termination handler was configured | Catch inside the listener-owned path, perform bounded shutdown, emit a fixed log, and never relaunch the fixed profile |
+
+Node documents that EventEmitter listeners are called synchronously and “Any values returned by the called listeners are ignored and discarded.” A rejected Promise therefore needs an explicit owned catch at this boundary. Source: [Node.js Events](https://nodejs.org/api/events.html#asynchronous-vs-synchronous).
+
+### Behavioral RED
+
+Initial log/disconnect RED:
+
+```text
+./node_modules/.bin/vitest run api/src/services/session.service.test.ts api/src/services/cdp/cdp.service.log-safety.test.ts
+Test Files  2 failed (2)
+Tests       4 failed | 26 passed (30)
+```
+
+The failures showed both temporary and explicit paths plus derived storage paths in real `ChromeContextService` logs, profile paths from real plugin/shutdown-hook failures, and one captured `unhandledRejection` from an unconfigured disconnect.
+
+Actual-listener RED after replacing the round-4 test entry points:
+
+```text
+Test Files  1 failed | 1 passed (2)
+Tests       6 failed | 25 passed (31)
+```
+
+Five failures were the missing production page/browser wiring seams used by the real launch path; the sixth was the old event-array expectation in the concurrency regression and was replaced with interface and call-order assertions.
+
+### Implemented behavior
+
+| Finding | Behavior after fix | Regression evidence |
+|---|---|---|
+| Real extraction secrecy | Real `ChromeContextService` receives the true reader path but logs no full path, basename, derived path, Error message, or cause | two real-service tests with temporary and explicit profiles |
+| Plugin/shutdown secrecy | Real plugin and shutdown-hook failures emit bounded messages without caught Error data | real `BasePlugin` + real `CDPService.shutdown()` regression |
+| File request/response | Both actual page listeners deliver `security_violation` to `SessionService` single-flight | EventEmitter request and response regressions |
+| Browser disconnect | Actual browser listener delivers `browser_disconnect`; pre-handler disconnect performs shutdown and resolves without `unhandledRejection` | configured and unconfigured EventEmitter regressions |
+| Ordered owned lifecycle | Real capture → real shutdown(reason) → owned deletion → real idle-launch interface, with browser launch mocked only at the external boundary | invocation-order assertions for request, response, and disconnect |
+| Fixed profile exclusion | No internal termination launch uses `/tmp/steel-chrome`; explicit/persist profiles remain caller-owned | termination and ownership regressions |
+
+### Startup fixed-profile inspection
+
+| Evidence | Result |
+|---|---|
+| `browser.ts` launches the default configuration only from the server `onListen` hook | It is startup/idle state, before a tenant session |
+| `browser-session.ts` constructs `SessionService` during plugin registration and installs the reason-bearing termination handler before `onListen` runs | The startup browser is not left with the pre-handler disconnect path during normal server startup |
+| `SessionService.startSession()` assigns an implicit tenant a fresh `steel-session-*` directory | Tenant state is directed to an owned ephemeral profile |
+| `isSimilarConfig()` explicitly compares `currentUserDataDir === nextUserDataDir` | The fixed startup profile cannot be reused for a tenant profile; CDP closes it before launching the distinct session directory |
+
+No concrete path was found for the startup fixed profile to receive tenant `sessionContext` through the `SessionService` lifecycle, so no startup-profile behavior was broadened in this round.
+
+### Fresh verification
+
+Focused:
+
+```text
+./node_modules/.bin/vitest run api/src/services/session.service.test.ts api/src/services/cdp/cdp.service.log-safety.test.ts
+Test Files  2 passed (2)
+Tests       31 passed (31)
+```
+
+Full API:
+
+```text
+npm test -w api
+Test Files  11 passed (11)
+Tests       104 passed | 2 skipped (106)
+```
+
+Build:
+
+```text
+npm run build -w api
+tsc && npm run copy:templates && npm run copy:fingerprint
+exit 0
+```
+
+`git diff --check` also exited zero.
+
+### Self-review
+
+| Risk | Result |
+|---|---|
+| Listener behavior diverges between tests and launch | Production launch calls the same two wiring methods exercised by the EventEmitter tests |
+| Path escapes through nested errors | Test failures carry both path-bearing messages and causes; complete captured logger arguments exclude full path, basename, and derived paths |
+| Request listener creates another unhandled rejection | The production listener owns a terminal catch with a fixed message |
+| Pre-handler disconnect launches fixed profile | It calls `shutdown(browser_disconnect)` only; no launch or profile allocation occurs |
+| Termination mocks hide ordering | Capture, shutdownSession, and launchIdle run their production implementations; only filesystem/readers/browser launch are bounded external fakes |
+| Startup default profile receives tenant state | Fresh tenant directories differ, and config reuse compares `userDataDir` |
+
+### Gate state and concerns
+
+`DONE_WITH_CONCERNS`: scoped Steel source, focused/full API tests, build, and diff check pass. No image build/deploy, production/provider browser action, or local browser/Mac-loop action was performed. Live container continuity remains the parent workflow’s post-fork gate.

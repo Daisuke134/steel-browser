@@ -1,7 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { EventEmitter } from "node:events";
 import { inspect } from "node:util";
 import { CDPService } from "./cdp/cdp.service.js";
 import { ShutdownReason } from "./cdp/plugins/core/base-plugin.js";
+import { ChromeContextService } from "./context/chrome-context.service.js";
+import { ChromeLocalStorageReader } from "./leveldb/localstorage.js";
+import { ChromeSessionStorageReader } from "./leveldb/sessionstorage.js";
+import { FileService } from "./file.service.js";
 import { SessionService } from "./session.service.js";
 
 const profileFs = vi.hoisted(() => ({
@@ -286,19 +291,38 @@ describe("implicit session profile isolation", () => {
   });
 });
 
-function createTerminationHarness(events: string[]) {
+function createTerminationHarness() {
   const cdpService = new CDPService({ keepAlive: true }, logger);
-  vi.spyOn(cdpService, "startNewSession").mockResolvedValue({} as any);
-  vi.spyOn(cdpService, "captureSessionContext").mockImplementation(async () => {
-    events.push("capture");
+  const page = Object.assign(new EventEmitter(), {
+    close: vi.fn(async () => undefined),
+    createCDPSession: vi.fn(async () => ({
+      detach: vi.fn(async () => undefined),
+      send: vi.fn(async () => ({ cookies: [] })),
+    })),
+    isClosed: vi.fn(() => false),
+    url: vi.fn(() => "about:blank"),
   });
-  vi.spyOn(cdpService, "shutdownSession").mockImplementation(async (reason) => {
-    events.push(`shutdown:${reason}`);
+  const browser = Object.assign(new EventEmitter(), {
+    close: vi.fn(async () => undefined),
+    pages: vi.fn(async () => [page]),
+    process: vi.fn(() => ({ kill: vi.fn(async () => undefined) })),
   });
-  const launchSpy = vi.spyOn(cdpService, "launch").mockImplementation(async (config) => {
-    events.push(`idle-launch:${config?.userDataDir}`);
-    return {} as any;
+  vi.spyOn(ChromeLocalStorageReader, "readLocalStorage").mockResolvedValue({});
+  vi.spyOn(ChromeSessionStorageReader, "readSessionStorage").mockResolvedValue({});
+  vi.spyOn(FileService, "getInstance").mockReturnValue({
+    cleanupFiles: vi.fn(async () => undefined),
+  } as any);
+  vi.spyOn(cdpService, "startNewSession").mockImplementation(async (config) => {
+    (cdpService as any).currentSessionConfig = config;
+    (cdpService as any).launchConfig = config;
+    (cdpService as any).browserInstance = browser;
+    (cdpService as any).primaryPage = page;
+    return browser as any;
   });
+  const captureSpy = vi.spyOn(cdpService, "captureSessionContext");
+  const shutdownSpy = vi.spyOn(cdpService, "shutdownSession");
+  const launchIdleSpy = vi.spyOn(cdpService, "launchIdle");
+  const launchSpy = vi.spyOn(cdpService, "launch").mockResolvedValue(browser as any);
   const service = new SessionService({
     cdpService,
     seleniumService: {
@@ -315,11 +339,22 @@ function createTerminationHarness(events: string[]) {
       timezone: "UTC",
       ...overrides,
     });
-  return { cdpService, launchSpy, service, start };
+  return {
+    browser,
+    captureSpy,
+    cdpService,
+    launchIdleSpy,
+    launchSpy,
+    page,
+    service,
+    shutdownSpy,
+    start,
+  };
 }
 
 describe("CDP-driven session termination ownership", () => {
   beforeEach(() => {
+    vi.restoreAllMocks();
     vi.clearAllMocks();
     profileFs.mkdir.mockReset().mockResolvedValue(undefined);
     profileFs.rm.mockReset().mockImplementation(async (profileDir) => {
@@ -333,76 +368,102 @@ describe("CDP-driven session termination ownership", () => {
   });
 
   it("routes a file security violation through capture, shutdown, owned delete, and distinct idle launch", async () => {
-    const events: string[] = [];
-    profileFs.rm.mockImplementation(async (profileDir) => {
-      events.push(`delete:${profileDir}`);
-    });
-    const { cdpService, launchSpy, start } = createTerminationHarness(events);
+    const { captureSpy, cdpService, launchIdleSpy, launchSpy, page, shutdownSpy, start } =
+      createTerminationHarness();
 
     await start();
-    await (cdpService as any).handlePageRequest(
-      {
-        url: () => "file:///tmp/steel-session-event/Default/Cookies",
-      },
-      {
-        close: vi.fn(async () => undefined),
-      },
-    );
+    (cdpService as any).wirePageEventHandlers(page);
+    page.emit("request", {
+      url: () => "file:///tmp/steel-session-event/Default/Cookies",
+    });
     await vi.waitFor(() => expect(launchSpy).toHaveBeenCalled());
 
-    expect(events).toEqual([
-      "capture",
-      `shutdown:${ShutdownReason.SECURITY_VIOLATION}`,
-      "delete:/tmp/steel-session-event",
-      "idle-launch:/tmp/steel-idle-event",
-    ]);
+    expect(captureSpy).toHaveBeenCalledOnce();
+    expect(shutdownSpy).toHaveBeenCalledWith(ShutdownReason.SECURITY_VIOLATION);
+    expect(launchIdleSpy).toHaveBeenCalledWith("/tmp/steel-idle-event");
+    expect(captureSpy.mock.invocationCallOrder[0]).toBeLessThan(
+      shutdownSpy.mock.invocationCallOrder[0],
+    );
+    expect(shutdownSpy.mock.invocationCallOrder[0]).toBeLessThan(
+      profileFs.rm.mock.invocationCallOrder[0],
+    );
+    expect(profileFs.rm.mock.invocationCallOrder[0]).toBeLessThan(
+      launchIdleSpy.mock.invocationCallOrder[0],
+    );
+    expect((cdpService as any).chromeSessionService).toBeInstanceOf(ChromeContextService);
     expect(launchSpy.mock.calls.map(([config]) => config?.userDataDir)).not.toContain(
       "/tmp/steel-chrome",
     );
   });
 
-  it("routes browser disconnect through capture, shutdown, owned delete, and distinct idle launch", async () => {
-    const events: string[] = [];
-    profileFs.rm.mockImplementation(async (profileDir) => {
-      events.push(`delete:${profileDir}`);
-    });
-    const { cdpService, launchSpy, start } = createTerminationHarness(events);
+  it("routes a file response through the same owned termination lifecycle", async () => {
+    const { captureSpy, cdpService, launchIdleSpy, launchSpy, page, shutdownSpy, start } =
+      createTerminationHarness();
 
     await start();
-    await (cdpService as any).onDisconnect();
+    (cdpService as any).wirePageEventHandlers(page);
+    page.emit("response", {
+      url: () => "file:///tmp/steel-session-event/Default/Session%20Storage",
+    });
+    await vi.waitFor(() => expect(launchSpy).toHaveBeenCalled());
 
-    expect(events).toEqual([
-      "capture",
-      "shutdown:browser_disconnect",
-      "delete:/tmp/steel-session-event",
-      "idle-launch:/tmp/steel-idle-event",
-    ]);
+    expect(captureSpy).toHaveBeenCalledOnce();
+    expect(shutdownSpy).toHaveBeenCalledWith(ShutdownReason.SECURITY_VIOLATION);
+    expect(launchIdleSpy).toHaveBeenCalledWith("/tmp/steel-idle-event");
+    expect(captureSpy.mock.invocationCallOrder[0]).toBeLessThan(
+      shutdownSpy.mock.invocationCallOrder[0],
+    );
+    expect(shutdownSpy.mock.invocationCallOrder[0]).toBeLessThan(
+      profileFs.rm.mock.invocationCallOrder[0],
+    );
+    expect(profileFs.rm.mock.invocationCallOrder[0]).toBeLessThan(
+      launchIdleSpy.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("routes browser disconnect through capture, shutdown, owned delete, and distinct idle launch", async () => {
+    const {
+      browser,
+      captureSpy,
+      cdpService,
+      launchIdleSpy,
+      launchSpy,
+      shutdownSpy,
+      start,
+    } = createTerminationHarness();
+
+    await start();
+    (cdpService as any).wireBrowserEventHandlers(browser);
+    browser.emit("disconnected");
+    await vi.waitFor(() => expect(launchSpy).toHaveBeenCalled());
+
+    expect(captureSpy).toHaveBeenCalledOnce();
+    expect(shutdownSpy).toHaveBeenCalledWith(ShutdownReason.BROWSER_DISCONNECT);
+    expect(launchIdleSpy).toHaveBeenCalledWith("/tmp/steel-idle-event");
+    expect(captureSpy.mock.invocationCallOrder[0]).toBeLessThan(
+      shutdownSpy.mock.invocationCallOrder[0],
+    );
+    expect(shutdownSpy.mock.invocationCallOrder[0]).toBeLessThan(
+      profileFs.rm.mock.invocationCallOrder[0],
+    );
+    expect(profileFs.rm.mock.invocationCallOrder[0]).toBeLessThan(
+      launchIdleSpy.mock.invocationCallOrder[0],
+    );
     expect(launchSpy.mock.calls.map(([config]) => config?.userDataDir)).not.toContain(
       "/tmp/steel-chrome",
     );
   });
 
   it("never deletes a caller-owned explicit profile during a security termination", async () => {
-    const events: string[] = [];
     profileFs.mkdtemp.mockReset().mockResolvedValueOnce("/tmp/steel-idle-explicit");
-    profileFs.rm.mockImplementation(async (profileDir) => {
-      events.push(`delete:${profileDir}`);
-    });
-    const { cdpService, launchSpy, start } = createTerminationHarness(events);
+    const { cdpService, launchSpy, page, start } = createTerminationHarness();
     const callerOwned = "/profiles/caller-owned-sensitive";
 
     await start({ userDataDir: callerOwned });
-    await (cdpService as any).handlePageRequest(
-      { url: () => `file://${callerOwned}/Default/Cookies` },
-      { close: vi.fn(async () => undefined) },
-    );
+    (cdpService as any).wirePageEventHandlers(page);
+    page.emit("request", { url: () => `file://${callerOwned}/Default/Cookies` });
     await vi.waitFor(() => expect(launchSpy).toHaveBeenCalled());
 
-    expect(events).toEqual([
-      "capture",
-      `shutdown:${ShutdownReason.SECURITY_VIOLATION}`,
-      "idle-launch:/tmp/steel-idle-explicit",
-    ]);
     expect(profileFs.rm).not.toHaveBeenCalledWith(callerOwned, expect.anything());
   });
 
@@ -411,7 +472,8 @@ describe("CDP-driven session termination ownership", () => {
     profileFs.rm.mockImplementation(async (profileDir) => {
       events.push(`delete:${profileDir}`);
     });
-    const { cdpService, launchSpy, service, start } = createTerminationHarness(events);
+    const { cdpService, launchIdleSpy, launchSpy, service, shutdownSpy, start } =
+      createTerminationHarness();
     const captureGate = Promise.withResolvers<void>();
     vi.mocked(cdpService.captureSessionContext).mockImplementation(async () => {
       events.push("capture");
@@ -429,12 +491,34 @@ describe("CDP-driven session termination ownership", () => {
 
     expect(events).toEqual([
       "capture",
-      `shutdown:${ShutdownReason.SESSION_END}`,
       "delete:/tmp/steel-session-event",
-      "idle-launch:/tmp/steel-idle-event",
     ]);
+    expect(shutdownSpy).toHaveBeenCalledWith(ShutdownReason.SESSION_END);
+    expect(launchIdleSpy).toHaveBeenCalledWith("/tmp/steel-idle-event");
     expect(cdpService.captureSessionContext).toHaveBeenCalledOnce();
     expect(profileFs.rm).toHaveBeenCalledOnce();
     expect(launchSpy).toHaveBeenCalledOnce();
+  });
+
+  it("fails closed without an unhandled rejection when browser disconnects before handler registration", async () => {
+    const cdpService = new CDPService({ keepAlive: true }, logger);
+    const browser = Object.assign(new EventEmitter(), {
+      close: vi.fn(async () => undefined),
+      process: vi.fn(() => ({ kill: vi.fn(async () => undefined) })),
+    });
+    const unhandled: unknown[] = [];
+    const onUnhandled = (error: unknown) => unhandled.push(error);
+    process.on("unhandledRejection", onUnhandled);
+    (cdpService as any).browserInstance = browser;
+    (cdpService as any).wireBrowserEventHandlers(browser);
+
+    browser.emit("disconnected");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    process.off("unhandledRejection", onUnhandled);
+    expect(unhandled).toEqual([]);
+    expect(browser.close).toHaveBeenCalledOnce();
+    expect((cdpService as any).browserInstance).toBeNull();
+    expect(profileFs.mkdtemp).not.toHaveBeenCalled();
   });
 });

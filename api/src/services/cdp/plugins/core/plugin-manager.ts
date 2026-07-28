@@ -56,7 +56,7 @@ export class PluginManager {
       try {
         await Promise.resolve(plugin.onSessionStart(sessionConfig));
       } catch (error) {
-        this.logger.error(`Error in plugin ${plugin.name}.onSessionStart: ${error}`);
+        this.logger.error(`Error in plugin ${plugin.name}.onSessionStart`);
       }
     });
     await Promise.all(promises);
@@ -70,7 +70,7 @@ export class PluginManager {
       try {
         await Promise.resolve(plugin.onBeforeSessionEnd(sessionConfig));
       } catch (error) {
-        this.logger.error(`Error in plugin ${plugin.name}.onBeforeSessionEnd: ${error}`);
+        this.logger.error(`Error in plugin ${plugin.name}.onBeforeSessionEnd`);
       }
     });
     await Promise.all(promises);
@@ -84,7 +84,7 @@ export class PluginManager {
       try {
         await Promise.resolve(plugin.onAfterSessionEnd(sessionConfig));
       } catch (error) {
-        this.logger.error(`Error in plugin ${plugin.name}.onAfterSessionEnd: ${error}`);
+        this.logger.error(`Error in plugin ${plugin.name}.onAfterSessionEnd`);
       }
     });
     await Promise.all(promises);
@@ -98,7 +98,7 @@ export class PluginManager {
       try {
         await plugin.onBrowserLaunch(browser);
       } catch (error) {
-        this.logger.error(`Error in plugin ${plugin.name}.onBrowserLaunch: ${error}`);
+        this.logger.error(`Error in plugin ${plugin.name}.onBrowserLaunch`);
       }
     });
     await Promise.all(promises);
@@ -110,7 +110,7 @@ export class PluginManager {
         // handle both async and sync hooks
         await Promise.resolve(plugin.onBrowserReady(context));
       } catch (error) {
-        this.logger.error(`Error in plugin ${plugin.name}.onBrowserReady: ${error}`);
+        this.logger.error(`Error in plugin ${plugin.name}.onBrowserReady`);
       }
     });
 
@@ -125,7 +125,7 @@ export class PluginManager {
       try {
         await plugin.onPageCreated(page);
       } catch (error) {
-        this.logger.error(`Error in plugin ${plugin.name}.onPageCreated: ${error}`);
+        this.logger.error(`Error in plugin ${plugin.name}.onPageCreated`);
       }
     });
     await Promise.all(promises);
@@ -139,7 +139,7 @@ export class PluginManager {
       try {
         await plugin.onBrowserClose(browser);
       } catch (error) {
-        this.logger.error(`Error in plugin ${plugin.name}.onBrowserClose: ${error}`);
+        this.logger.error(`Error in plugin ${plugin.name}.onBrowserClose`);
       }
     });
     await Promise.all(promises);
@@ -153,7 +153,7 @@ export class PluginManager {
       try {
         await plugin.onPageNavigate(page);
       } catch (error) {
-        this.logger.error(`Error in plugin ${plugin.name}.onPageNavigate: ${error}`);
+        this.logger.error(`Error in plugin ${plugin.name}.onPageNavigate`);
       }
     });
     await Promise.all(promises);
@@ -167,7 +167,7 @@ export class PluginManager {
       try {
         await plugin.onPageUnload(page);
       } catch (error) {
-        this.logger.error(`Error in plugin ${plugin.name}.onPageUnload: ${error}`);
+        this.logger.error(`Error in plugin ${plugin.name}.onPageUnload`);
       }
     });
     await Promise.all(promises);
@@ -181,7 +181,7 @@ export class PluginManager {
       try {
         await plugin.onBeforePageClose(page);
       } catch (error) {
-        this.logger.error(`Error in plugin ${plugin.name}.onBeforePageClose: ${error}`);
+        this.logger.error(`Error in plugin ${plugin.name}.onBeforePageClose`);
       }
     });
     await Promise.all(promises);
@@ -195,7 +195,7 @@ export class PluginManager {
       try {
         await plugin.onShutdown(reason);
       } catch (error) {
-        this.logger.error(`Error in plugin ${plugin.name}.onShutdown: ${error}`);
+        this.logger.error(`Error in plugin ${plugin.name}.onShutdown`);
       }
     });
     await Promise.all(promises);
@@ -209,7 +209,7 @@ export class PluginManager {
       try {
         await plugin.onSessionEnd(sessionConfig);
       } catch (error) {
-        this.logger.error(`Error in plugin ${plugin.name}.onSessionEnd: ${error}`);
+        this.logger.error(`Error in plugin ${plugin.name}.onSessionEnd`);
       }
     });
     await Promise.all(promises);

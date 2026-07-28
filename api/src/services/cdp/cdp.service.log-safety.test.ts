@@ -1,6 +1,11 @@
 import { readFile } from "node:fs/promises";
+import path from "node:path";
 import { inspect } from "node:util";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { ChromeContextService } from "../context/chrome-context.service.js";
+import { ChromeLocalStorageReader } from "../leveldb/localstorage.js";
+import { ChromeSessionStorageReader } from "../leveldb/sessionstorage.js";
+import { BasePlugin, ShutdownReason } from "./plugins/core/base-plugin.js";
 import * as cdpModule from "./cdp.service.js";
 
 function createLogger() {
@@ -15,7 +20,70 @@ function createLogger() {
   return { logger, messages };
 }
 
+function expectNoProfilePath(messages: unknown[], profileDir: string) {
+  const logged = inspect(messages, { depth: null });
+  expect(logged).not.toContain(profileDir);
+  expect(logged).not.toContain(path.basename(profileDir));
+  expect(logged).not.toContain("Default/Local Storage/leveldb");
+  expect(logged).not.toContain("Default/Session Storage");
+}
+
 describe("CDP profile path log safety", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it.each([
+    ["auto-owned temporary", "/tmp/steel-session-secret-context"],
+    ["caller-owned explicit", "/profiles/caller-owned-secret-context"],
+  ])(
+    "real ChromeContextService redacts %s paths and path-bearing extraction failures",
+    async (_kind, profileDir) => {
+      const { logger, messages } = createLogger();
+      const service = new ChromeContextService(logger);
+      vi.spyOn(ChromeLocalStorageReader, "readLocalStorage").mockRejectedValueOnce(
+        new Error(`cannot open ${profileDir}/Default/Local Storage/leveldb/LOG`, {
+          cause: new Error(`leveldb cause at ${profileDir}`),
+        }),
+      );
+      vi.spyOn(ChromeSessionStorageReader, "readSessionStorage").mockRejectedValueOnce(
+        new Error(`cannot open ${profileDir}/Default/Session Storage/CURRENT`, {
+          cause: new Error(`session cause at ${profileDir}`),
+        }),
+      );
+
+      await expect(service.getSessionData(profileDir)).resolves.toEqual({});
+
+      expectNoProfilePath(messages, profileDir);
+    },
+  );
+
+  it("redacts path-bearing plugin and shutdown failures without replacing ChromeContextService", async () => {
+    const { logger, messages } = createLogger();
+    const service = new cdpModule.CDPService({ keepAlive: true }, logger);
+    const profileDir = "/tmp/steel-session-secret-shutdown";
+
+    class PathFailurePlugin extends BasePlugin {
+      public override async onShutdown(): Promise<void> {
+        throw new Error(`plugin failed at ${profileDir}/Default`, {
+          cause: new Error(`plugin cause at ${profileDir}`),
+        });
+      }
+    }
+
+    service.registerPlugin(new PathFailurePlugin({ name: "path-failure" }));
+    service.registerShutdownHook(async () => {
+      throw new Error(`shutdown failed at ${profileDir}/Default`, {
+        cause: new Error(`shutdown cause at ${profileDir}`),
+      });
+    });
+
+    await expect(service.shutdown(ShutdownReason.SESSION_END)).rejects.toThrow();
+
+    expect((service as any).chromeSessionService).toBeInstanceOf(ChromeContextService);
+    expectNoProfilePath(messages, profileDir);
+  });
+
   it("redacts temporary and caller-owned userDataDir values from launch logs", () => {
     const redact = (cdpModule as any).redactLaunchOptionsForLog;
     expect(redact).toBeTypeOf("function");
