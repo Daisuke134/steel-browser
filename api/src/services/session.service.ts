@@ -67,6 +67,7 @@ export class SessionService {
   public activeSession: Session;
   private ownedSessionProfileDir: string | null = null;
   private ownedIdleProfileDir: string | null = null;
+  private releasePromise: Promise<SessionDetails> | null = null;
 
   constructor(config: {
     cdpService: CDPService;
@@ -79,6 +80,9 @@ export class SessionService {
     this.fileService = config.fileService;
     this.logger = config.logger;
     this.timezoneFetcher = new TimezoneFetcher(config.logger);
+    this.cdpService.setSessionTerminationHandler(async (reason) => {
+      await this.endSession(reason);
+    });
     this.activeSession = {
       id: uuidv4(),
       createdAt: new Date().toISOString(),
@@ -298,13 +302,31 @@ export class SessionService {
         ownedSessionProfileDir,
         previousOwnedIdleProfileDir,
       ]).catch((cleanupError) => {
-        this.logger.error({ cleanupError }, "Failed to remove owned browser profiles");
+        this.logger.error("Failed to remove owned browser profiles");
       });
       throw error;
     }
   }
 
-  public async endSession(): Promise<SessionDetails> {
+  public async endSession(
+    reason: ShutdownReason = ShutdownReason.SESSION_END,
+  ): Promise<SessionDetails> {
+    if (this.releasePromise) {
+      return this.releasePromise;
+    }
+
+    const releasePromise = this.releaseSession(reason);
+    this.releasePromise = releasePromise;
+    try {
+      return await releasePromise;
+    } finally {
+      if (this.releasePromise === releasePromise) {
+        this.releasePromise = null;
+      }
+    }
+  }
+
+  private async releaseSession(reason: ShutdownReason): Promise<SessionDetails> {
     this.activeSession.complete();
     this.activeSession.status = "released";
     this.activeSession.duration =
@@ -336,7 +358,7 @@ export class SessionService {
     } else {
       await attemptReleaseStep(() => this.cdpService.captureSessionContext());
       await attemptReleaseStep(() =>
-        this.cdpService.shutdownSession(ShutdownReason.SESSION_END),
+        this.cdpService.shutdownSession(reason),
       );
     }
 
@@ -357,7 +379,7 @@ export class SessionService {
       await this.cdpService.shutdown(ShutdownReason.LAUNCH_FAILURE).catch(() => {});
       this.ownedIdleProfileDir = null;
       await this.removeOwnedProfiles([idleProfileDir]).catch((cleanupError) => {
-        this.logger.error({ cleanupError }, "Failed to remove owned idle browser profile");
+        this.logger.error("Failed to remove owned idle browser profile");
       });
       throw error;
     }
@@ -413,7 +435,7 @@ export class SessionService {
         retryDelay: 100,
       });
     } catch (error) {
-      throw new Error("ephemeral browser profile cleanup failed", { cause: error });
+      throw new Error("ephemeral browser profile cleanup failed");
     }
   }
 

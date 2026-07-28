@@ -1,15 +1,16 @@
 import { readFile } from "node:fs/promises";
+import { inspect } from "node:util";
 import { describe, expect, it, vi } from "vitest";
 import * as cdpModule from "./cdp.service.js";
 
 function createLogger() {
-  const messages: string[] = [];
+  const messages: unknown[] = [];
   const logger: any = {
     child: vi.fn(() => logger),
-    debug: vi.fn((value: unknown) => messages.push(String(value))),
-    error: vi.fn((value: unknown) => messages.push(String(value))),
-    info: vi.fn((value: unknown) => messages.push(String(value))),
-    warn: vi.fn((value: unknown) => messages.push(String(value))),
+    debug: vi.fn((...values: unknown[]) => messages.push(...values)),
+    error: vi.fn((...values: unknown[]) => messages.push(...values)),
+    info: vi.fn((...values: unknown[]) => messages.push(...values)),
+    warn: vi.fn((...values: unknown[]) => messages.push(...values)),
   };
   return { logger, messages };
 }
@@ -58,7 +59,53 @@ describe("CDP profile path log safety", () => {
 
     await service.getBrowserState();
 
-    expect(messages.join("\n")).not.toContain(profileDir);
+    expect(inspect(messages, { depth: null })).not.toContain(profileDir);
     expect(messages).toContain("[CDPService] Dumping session data");
+  });
+
+  it.each([
+    ["auto-owned temporary", "/tmp/steel-session-secret-tenant"],
+    ["caller-owned explicit", "/profiles/caller-owned-sensitive"],
+  ])(
+    "redacts %s profile paths from browser-state failure logs",
+    async (_kind, profileDir) => {
+      const { logger, messages } = createLogger();
+      const service = new cdpModule.CDPService({ keepAlive: true }, logger);
+
+      (service as any).browserInstance = {};
+      (service as any).primaryPage = {};
+      (service as any).launchConfig = { options: {}, userDataDir: profileDir };
+      (service as any).chromeSessionService = {
+        getSessionData: vi.fn(async () => {
+          throw new Error(`failed to read ${profileDir}/Default/Cookies`);
+        }),
+      };
+      (service as any).getExistingPageSessionData = vi.fn(async () => ({}));
+      vi.spyOn(service, "getCookies").mockResolvedValue([]);
+
+      await service.getBrowserState();
+
+      const logged = inspect(messages, { depth: null });
+      expect(logged).not.toContain(profileDir);
+      expect(logged).toContain("[CDPService] Error dumping session data");
+    },
+  );
+
+  it.each([
+    ["auto-owned temporary", "/tmp/steel-session-secret-tenant"],
+    ["caller-owned explicit", "/profiles/caller-owned-sensitive"],
+  ])("redacts %s profile paths from file-protocol security logs", async (_kind, profileDir) => {
+    const { logger, messages } = createLogger();
+    const service = new cdpModule.CDPService({ keepAlive: true }, logger);
+    service.setSessionTerminationHandler(async () => undefined);
+
+    await (service as any).handlePageRequest(
+      { url: () => `file://${profileDir}/Default/Cookies` },
+      { close: vi.fn(async () => undefined) },
+    );
+
+    const logged = inspect(messages, { depth: null });
+    expect(logged).not.toContain(profileDir);
+    expect(logged).toContain("[CDPService] Blocked request from file protocol");
   });
 });

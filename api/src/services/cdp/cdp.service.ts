@@ -121,7 +121,9 @@ export class CDPService extends EventEmitter {
   private proxyWebSocketHandler:
     | ((req: IncomingMessage, socket: Duplex, head: Buffer) => Promise<void>)
     | null = null;
-  private disconnectHandler: () => Promise<void> = () => this.endSession();
+  private sessionTerminationHandler:
+    | ((reason: ShutdownReason) => Promise<void>)
+    | null = null;
 
   constructor(
     config: { keepAlive?: boolean },
@@ -214,7 +216,13 @@ export class CDPService extends EventEmitter {
   }
 
   public setDisconnectHandler(handler: () => Promise<void>): void {
-    this.disconnectHandler = handler;
+    this.sessionTerminationHandler = async () => handler();
+  }
+
+  public setSessionTerminationHandler(
+    handler: (reason: ShutdownReason) => Promise<void>,
+  ): void {
+    this.sessionTerminationHandler = handler;
   }
 
   public getBrowserInstance(): Browser | null {
@@ -389,11 +397,13 @@ export class CDPService extends EventEmitter {
 
         page.on("response", (response) => {
           if (response.url().startsWith("file://")) {
-            this.logger.error(
-              `[CDPService] Blocked response from file protocol: ${response.url()}`,
-            );
+            this.logger.error("[CDPService] Blocked response from file protocol");
             page.close().catch(() => {});
-            this.endSession(ShutdownReason.SECURITY_VIOLATION);
+            void this.requestSessionTermination(ShutdownReason.SECURITY_VIOLATION).catch(() => {
+              this.logger.error(
+                "[CDPService] Session termination failed after a security violation",
+              );
+            });
           }
         });
       }
@@ -449,9 +459,9 @@ export class CDPService extends EventEmitter {
     }
 
     if (url.startsWith("file://")) {
-      this.logger.error(`[CDPService] Blocked request to file protocol: ${url}`);
-      page.close().catch(() => {});
-      this.endSession(ShutdownReason.SECURITY_VIOLATION);
+      this.logger.error("[CDPService] Blocked request from file protocol");
+      await page.close().catch(() => {});
+      await this.requestSessionTermination(ShutdownReason.SECURITY_VIOLATION);
     } else {
       await request.continue();
     }
@@ -1236,8 +1246,7 @@ export class CDPService extends EventEmitter {
       this.logger.info("[CDPService] Session data dumped successfully");
       return result;
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      this.logger.error(`[CDPService] Error dumping session data: ${errorMessage}`);
+      this.logger.error("[CDPService] Error dumping session data");
       return {};
     }
   }
@@ -1392,15 +1401,13 @@ export class CDPService extends EventEmitter {
     reason: ShutdownReason = ShutdownReason.SESSION_END,
     idleUserDataDir?: string,
   ): Promise<void> {
+    if (!idleUserDataDir) {
+      throw new Error("owned idle profile directory is required");
+    }
+
     await this.captureSessionContext();
     await this.shutdownSession(reason);
-
-    // Relaunch the idle browser
-    if (idleUserDataDir) {
-      await this.launchIdle(idleUserDataDir);
-    } else {
-      await this.launch(this.defaultLaunchConfig);
-    }
+    await this.launchIdle(idleUserDataDir);
   }
 
   private async onDisconnect(): Promise<void> {
@@ -1410,7 +1417,15 @@ export class CDPService extends EventEmitter {
       return;
     }
 
-    await this.disconnectHandler();
+    await this.requestSessionTermination(ShutdownReason.BROWSER_DISCONNECT);
+  }
+
+  private async requestSessionTermination(reason: ShutdownReason): Promise<void> {
+    if (!this.sessionTerminationHandler) {
+      throw new Error("session termination handler is not configured");
+    }
+
+    await this.sessionTerminationHandler(reason);
   }
 
   @traceable
