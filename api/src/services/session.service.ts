@@ -210,48 +210,50 @@ export class SessionService {
       await this.activeSession.proxyServer.listen();
     }
 
-    const explicitUserDataDir =
-      typeof options.userDataDir === "string" && options.userDataDir.trim()
-        ? options.userDataDir
-        : null;
-    const ownedSessionProfileDir =
-      explicitUserDataDir || options.persist === true
-        ? null
-        : await this.createOwnedProfile("steel-session-");
-    const userDataDir =
-      explicitUserDataDir ||
-      (options.persist === true
-        ? path.join(dirname(fileURLToPath(import.meta.url)), "..", "..", "user-data-dir")
-        : ownedSessionProfileDir!);
-    await mkdir(userDataDir, { recursive: true });
-
-    const browserLauncherOptions: BrowserLauncherOptions = {
-      options: {
-        headless: headless ?? env.CHROME_HEADLESS,
-        proxyUrl: this.activeSession.proxyServer?.url,
-      },
-      sessionContext,
-      userAgent,
-      blockAds,
-      fingerprint,
-      optimizeBandwidth: normalizedOptimize,
-      extensions: extensions || [],
-      logSinkUrl,
-      timezone: timezonePromise,
-      dimensions: finalDimensions,
-      userDataDir,
-      userPreferences: mergedUserPreferences,
-      extra,
-      credentials,
-      skipFingerprintInjection,
-      deviceConfig,
-      fullscreen,
-      dangerouslyLogRequestDetails,
-      captureWorkerNetwork,
-      caCertificates,
-    };
-
+    let ownedSessionProfileDir: string | null = null;
+    const previousOwnedIdleProfileDir = this.ownedIdleProfileDir;
     try {
+      const explicitUserDataDir =
+        typeof options.userDataDir === "string" && options.userDataDir.trim()
+          ? options.userDataDir
+          : null;
+      ownedSessionProfileDir =
+        explicitUserDataDir || options.persist === true
+          ? null
+          : await this.createOwnedProfile("steel-session-");
+      const userDataDir =
+        explicitUserDataDir ||
+        (options.persist === true
+          ? path.join(dirname(fileURLToPath(import.meta.url)), "..", "..", "user-data-dir")
+          : ownedSessionProfileDir!);
+      await mkdir(userDataDir, { recursive: true });
+
+      const browserLauncherOptions: BrowserLauncherOptions = {
+        options: {
+          headless: headless ?? env.CHROME_HEADLESS,
+          proxyUrl: this.activeSession.proxyServer?.url,
+        },
+        sessionContext,
+        userAgent,
+        blockAds,
+        fingerprint,
+        optimizeBandwidth: normalizedOptimize,
+        extensions: extensions || [],
+        logSinkUrl,
+        timezone: timezonePromise,
+        dimensions: finalDimensions,
+        userDataDir,
+        userPreferences: mergedUserPreferences,
+        extra,
+        credentials,
+        skipFingerprintInjection,
+        deviceConfig,
+        fullscreen,
+        dangerouslyLogRequestDetails,
+        captureWorkerNetwork,
+        caCertificates,
+      };
+
       if (isSelenium) {
         await this.cdpService.shutdown(ShutdownReason.MODE_SWITCH);
         await this.seleniumService.launch(browserLauncherOptions);
@@ -282,17 +284,22 @@ export class SessionService {
         });
       }
 
-      if (this.ownedIdleProfileDir) {
-        await this.removeOwnedProfile(this.ownedIdleProfileDir);
-        this.ownedIdleProfileDir = null;
+      if (previousOwnedIdleProfileDir) {
+        await this.removeOwnedProfile(previousOwnedIdleProfileDir);
       }
+      this.ownedIdleProfileDir = null;
       this.ownedSessionProfileDir = ownedSessionProfileDir;
       return this.activeSession;
     } catch (error) {
       await this.cdpService.shutdown(ShutdownReason.LAUNCH_FAILURE).catch(() => {});
-      if (ownedSessionProfileDir) {
-        await this.removeOwnedProfile(ownedSessionProfileDir);
-      }
+      this.ownedSessionProfileDir = null;
+      this.ownedIdleProfileDir = null;
+      await this.removeOwnedProfiles([
+        ownedSessionProfileDir,
+        previousOwnedIdleProfileDir,
+      ]).catch((cleanupError) => {
+        this.logger.error({ cleanupError }, "Failed to remove owned browser profiles");
+      });
       throw error;
     }
   }
@@ -308,25 +315,50 @@ export class SessionService {
       this.activeSession.proxyRxBytes = this.activeSession.proxyServer.rxBytes;
     }
 
-    const idleProfileDir = await this.createOwnedProfile("steel-idle-");
-    let idleBrowserLaunched = false;
+    const ownedSessionProfileDir = this.ownedSessionProfileDir;
+    const previousOwnedIdleProfileDir = this.ownedIdleProfileDir;
+    this.ownedSessionProfileDir = null;
+    this.ownedIdleProfileDir = null;
+
+    let releaseError: unknown = null;
+    const attemptReleaseStep = async (operation: () => Promise<void>): Promise<void> => {
+      try {
+        await operation();
+      } catch (error) {
+        releaseError ??= error;
+      }
+    };
+
+    if (this.activeSession.isSelenium) {
+      await attemptReleaseStep(async () => {
+        await Promise.resolve(this.seleniumService.close());
+      });
+    } else {
+      await attemptReleaseStep(() => this.cdpService.captureSessionContext());
+      await attemptReleaseStep(() =>
+        this.cdpService.shutdownSession(ShutdownReason.SESSION_END),
+      );
+    }
+
+    await attemptReleaseStep(() =>
+      this.removeOwnedProfiles([ownedSessionProfileDir, previousOwnedIdleProfileDir]),
+    );
+
+    if (releaseError) {
+      throw releaseError;
+    }
+
+    let idleProfileDir: string | null = null;
     try {
-      if (this.activeSession.isSelenium) {
-        this.seleniumService.close();
-        await this.cdpService.launchIdle(idleProfileDir);
-      } else {
-        await this.cdpService.endSession(ShutdownReason.SESSION_END, idleProfileDir);
-      }
-      idleBrowserLaunched = true;
+      idleProfileDir = await this.createOwnedProfile("steel-idle-");
+      await this.cdpService.launchIdle(idleProfileDir);
       this.ownedIdleProfileDir = idleProfileDir;
-      if (this.ownedSessionProfileDir) {
-        await this.removeOwnedProfile(this.ownedSessionProfileDir);
-        this.ownedSessionProfileDir = null;
-      }
     } catch (error) {
-      if (!idleBrowserLaunched) {
-        await this.removeOwnedProfile(idleProfileDir).catch(() => {});
-      }
+      await this.cdpService.shutdown(ShutdownReason.LAUNCH_FAILURE).catch(() => {});
+      this.ownedIdleProfileDir = null;
+      await this.removeOwnedProfiles([idleProfileDir]).catch((cleanupError) => {
+        this.logger.error({ cleanupError }, "Failed to remove owned idle browser profile");
+      });
       throw error;
     }
 
@@ -382,6 +414,22 @@ export class SessionService {
       });
     } catch (error) {
       throw new Error("ephemeral browser profile cleanup failed", { cause: error });
+    }
+  }
+
+  private async removeOwnedProfiles(profileDirs: Array<string | null>): Promise<void> {
+    let firstError: unknown = null;
+
+    for (const profileDir of new Set(profileDirs.filter((value): value is string => !!value))) {
+      try {
+        await this.removeOwnedProfile(profileDir);
+      } catch (error) {
+        firstError ??= error;
+      }
+    }
+
+    if (firstError) {
+      throw firstError;
     }
   }
 }

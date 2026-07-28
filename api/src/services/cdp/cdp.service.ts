@@ -80,6 +80,17 @@ import {
 import { executeBestEffort, executeCritical, executeOptional } from "./utils/error-handlers.js";
 import { TimezoneFetcher } from "../timezone-fetcher.service.js";
 
+export function redactLaunchOptionsForLog<T extends Record<string, unknown>>(options: T): T {
+  if (!Object.prototype.hasOwnProperty.call(options, "userDataDir")) {
+    return { ...options };
+  }
+
+  return {
+    ...options,
+    userDataDir: "[redacted]",
+  };
+}
+
 export class CDPService extends EventEmitter {
   private logger: FastifyBaseLogger;
   private keepAlive: boolean;
@@ -919,10 +930,10 @@ export class CDPService extends EventEmitter {
         };
 
         this.logger.info(`[CDPService] Launch Options:`);
-        this.logger.info(JSON.stringify(finalLaunchOptions, null, 2));
+        this.logger.info(JSON.stringify(redactLaunchOptionsForLog(finalLaunchOptions), null, 2));
 
         if (userDataDir && this.launchConfig.userPreferences) {
-          this.logger.info(`[CDPService] Setting up user preferences in ${userDataDir}`);
+          this.logger.info("[CDPService] Setting up user preferences");
           await executeBestEffort(
             this.logger,
             async () => this.setupUserPreferences(userDataDir, this.launchConfig!.userPreferences!),
@@ -1196,7 +1207,7 @@ export class CDPService extends EventEmitter {
     }
 
     try {
-      this.logger.info(`[CDPService] Dumping session data from userDataDir: ${userDataDir}`);
+      this.logger.info("[CDPService] Dumping session data");
 
       // Run session data extraction and CDP storage extraction in parallel
       const [cookieData, sessionData, storageData] = await Promise.all([
@@ -1337,42 +1348,59 @@ export class CDPService extends EventEmitter {
     });
   }
 
+  public async captureSessionContext(): Promise<void> {
+    this.sessionContext = await this.getBrowserState();
+  }
+
+  public async shutdownSession(
+    reason: ShutdownReason = ShutdownReason.SESSION_END,
+  ): Promise<void> {
+    this.logger.info("Ending current session and resetting to default configuration.");
+    const sessionConfig = this.currentSessionConfig ?? this.defaultLaunchConfig;
+    let firstError: unknown = null;
+
+    const attempt = async (operation: () => Promise<void>): Promise<void> => {
+      try {
+        await operation();
+      } catch (error) {
+        firstError ??= error;
+      }
+    };
+
+    await attempt(() => this.pluginManager.onBeforeSessionEnd(sessionConfig));
+    await attempt(() => this.shutdown(reason));
+    await attempt(() => this.pluginManager.onSessionEnd(sessionConfig));
+
+    this.currentSessionConfig = null;
+    this.sessionContext = null;
+    this.trackedOrigins.clear();
+    this.instrumentationLogger.resetContext();
+    this.targetInstrumentationManager = new TargetInstrumentationManager(
+      this.instrumentationLogger,
+      this.logger,
+    );
+
+    await attempt(() => this.pluginManager.onAfterSessionEnd(sessionConfig));
+
+    if (firstError) {
+      throw firstError;
+    }
+  }
+
   @traceable
   public async endSession(
     reason: ShutdownReason = ShutdownReason.SESSION_END,
     idleUserDataDir?: string,
   ): Promise<void> {
-    this.logger.info("Ending current session and resetting to default configuration.");
-    const sessionConfig = this.currentSessionConfig!;
-
-    this.sessionContext = await this.getBrowserState().catch(() => null);
-
-    try {
-      await this.pluginManager.onBeforeSessionEnd(sessionConfig);
-      await this.shutdown(reason);
-      await this.pluginManager.onSessionEnd(sessionConfig);
-      this.currentSessionConfig = null;
-      this.sessionContext = null;
-      this.trackedOrigins.clear();
-
-      this.instrumentationLogger.resetContext();
-
-      // Reset target instrumentation manager to clear session-specific options
-      // (e.g. dangerous logging flags) so they don't leak into the idle browser
-      this.targetInstrumentationManager = new TargetInstrumentationManager(
-        this.instrumentationLogger,
-        this.logger,
-      );
-    } finally {
-      await this.pluginManager.onAfterSessionEnd(sessionConfig);
-    }
+    await this.captureSessionContext();
+    await this.shutdownSession(reason);
 
     // Relaunch the idle browser
-    await this.launch(
-      idleUserDataDir
-        ? { ...this.defaultLaunchConfig, userDataDir: idleUserDataDir }
-        : this.defaultLaunchConfig,
-    );
+    if (idleUserDataDir) {
+      await this.launchIdle(idleUserDataDir);
+    } else {
+      await this.launch(this.defaultLaunchConfig);
+    }
   }
 
   private async onDisconnect(): Promise<void> {
@@ -1557,16 +1585,16 @@ export class CDPService extends EventEmitter {
         const existingContent = await fs.promises.readFile(preferencesPath, "utf8");
         existingPreferences = JSON.parse(existingContent);
       } catch (error) {
-        this.logger.debug(`[CDPService] No existing preferences found, creating new: ${error}`);
+        this.logger.debug("[CDPService] No existing preferences found, creating new");
       }
 
       const mergedPreferences = deepMerge(existingPreferences, userPreferences);
 
       await fs.promises.writeFile(preferencesPath, JSON.stringify(mergedPreferences, null, 2));
 
-      this.logger.info(`[CDPService] User preferences written to ${preferencesPath}`);
+      this.logger.info("[CDPService] User preferences written");
     } catch (error) {
-      this.logger.error(`[CDPService] Error setting up user preferences: ${error}`);
+      this.logger.error("[CDPService] Error setting up user preferences");
       throw error;
     }
   }

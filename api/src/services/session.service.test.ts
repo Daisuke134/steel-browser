@@ -5,7 +5,9 @@ import { SessionService } from "./session.service.js";
 const profileFs = vi.hoisted(() => ({
   mkdir: vi.fn(async () => undefined),
   mkdtemp: vi.fn<() => Promise<string>>(),
-  rm: vi.fn(async () => undefined),
+  rm: vi.fn<(profileDir: string, options?: Record<string, unknown>) => Promise<void>>(
+    async () => undefined,
+  ),
 }));
 
 vi.mock("fs/promises", () => profileFs);
@@ -18,13 +20,21 @@ const logger: any = {
   warn: vi.fn(),
 };
 
-function createHarness() {
+function createHarness(events: string[] = []) {
   const cdpService: any = {
+    captureSessionContext: vi.fn(async () => {
+      events.push("capture");
+    }),
     endSession: vi.fn(async () => undefined),
     getDimensions: vi.fn(() => ({ width: 1920, height: 1080 })),
     getUserAgent: vi.fn(() => "test-agent"),
-    launch: vi.fn(async () => undefined),
+    launchIdle: vi.fn(async () => {
+      events.push("idle-launch");
+    }),
     shutdown: vi.fn(async () => undefined),
+    shutdownSession: vi.fn(async () => {
+      events.push("shutdown");
+    }),
     startNewSession: vi.fn(async () => undefined),
   };
   const seleniumService: any = {
@@ -51,6 +61,7 @@ function createHarness() {
 describe("implicit session profile isolation", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    profileFs.mkdir.mockReset().mockResolvedValue(undefined);
     profileFs.mkdtemp.mockReset();
     profileFs.rm.mockReset().mockResolvedValue(undefined);
     profileFs.mkdtemp
@@ -125,11 +136,28 @@ describe("implicit session profile isolation", () => {
     await start();
     await service.endSession();
 
-    expect(cdpService.endSession).toHaveBeenCalledWith(
-      ShutdownReason.SESSION_END,
-      "/tmp/steel-idle-a",
-    );
+    expect(cdpService.captureSessionContext).toHaveBeenCalledOnce();
+    expect(cdpService.shutdownSession).toHaveBeenCalledWith(ShutdownReason.SESSION_END);
+    expect(cdpService.launchIdle).toHaveBeenCalledWith("/tmp/steel-idle-a");
     expect("/tmp/steel-idle-a").not.toBe("/tmp/steel-session-a");
+  });
+
+  it("captures, shuts down, deletes the live profile, then launches idle", async () => {
+    const events: string[] = [];
+    const { service, start } = createHarness(events);
+    profileFs.rm.mockImplementation(async (profileDir) => {
+      events.push(`delete:${profileDir}`);
+    });
+
+    await start();
+    await service.endSession();
+
+    expect(events).toEqual([
+      "capture",
+      "shutdown",
+      "delete:/tmp/steel-session-a",
+      "idle-launch",
+    ]);
   });
 
   it("bounds recursive cleanup retries", async () => {
@@ -170,5 +198,75 @@ describe("implicit session profile isolation", () => {
 
     expect(profile).toContain("user-data-dir");
     expect(profileFs.rm).not.toHaveBeenCalledWith(profile, expect.anything());
+  });
+
+  it("cleans the owned live directory when mkdir fails", async () => {
+    const { start } = createHarness();
+    profileFs.mkdir.mockRejectedValueOnce(new Error("mkdir failed"));
+
+    await expect(start()).rejects.toThrow("mkdir failed");
+    expect(profileFs.rm).toHaveBeenCalledWith(
+      "/tmp/steel-session-a",
+      expect.objectContaining({ force: true, recursive: true }),
+    );
+  });
+
+  it("never deletes a caller-owned directory when its mkdir fails", async () => {
+    const { start } = createHarness();
+    profileFs.mkdir.mockRejectedValueOnce(new Error("mkdir failed"));
+
+    await expect(start(undefined, { userDataDir: "/profiles/caller-owned" })).rejects.toThrow(
+      "mkdir failed",
+    );
+    expect(profileFs.rm).not.toHaveBeenCalledWith(
+      "/profiles/caller-owned",
+      expect.anything(),
+    );
+  });
+
+  it("shuts down and cleans the live directory when context capture fails", async () => {
+    const { cdpService, service, start } = createHarness();
+    cdpService.captureSessionContext.mockRejectedValueOnce(new Error("capture failed"));
+
+    await start();
+    await expect(service.endSession()).rejects.toThrow("capture failed");
+
+    expect(cdpService.shutdownSession).toHaveBeenCalledWith(ShutdownReason.SESSION_END);
+    expect(profileFs.rm).toHaveBeenCalledWith(
+      "/tmp/steel-session-a",
+      expect.objectContaining({ force: true, recursive: true }),
+    );
+  });
+
+  it("cleans the live directory when shutdown fails", async () => {
+    const { cdpService, service, start } = createHarness();
+    cdpService.shutdownSession.mockRejectedValueOnce(new Error("shutdown failed"));
+
+    await start();
+    await expect(service.endSession()).rejects.toThrow("shutdown failed");
+
+    expect(profileFs.rm).toHaveBeenCalledWith(
+      "/tmp/steel-session-a",
+      expect.objectContaining({ force: true, recursive: true }),
+    );
+  });
+
+  it("cleans live and idle directories and restores ownership when idle launch fails", async () => {
+    const { cdpService, service, start } = createHarness();
+    cdpService.launchIdle.mockRejectedValueOnce(new Error("idle failed"));
+
+    await start();
+    await expect(service.endSession()).rejects.toThrow("idle failed");
+
+    expect(profileFs.rm).toHaveBeenCalledWith(
+      "/tmp/steel-session-a",
+      expect.objectContaining({ force: true, recursive: true }),
+    );
+    expect(profileFs.rm).toHaveBeenCalledWith(
+      "/tmp/steel-idle-a",
+      expect.objectContaining({ force: true, recursive: true }),
+    );
+    expect((service as any).ownedSessionProfileDir).toBeNull();
+    expect((service as any).ownedIdleProfileDir).toBeNull();
   });
 });
