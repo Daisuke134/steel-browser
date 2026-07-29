@@ -103,9 +103,9 @@ export async function extractStorageForPage(
         });
 
         if (localStorageResponse?.entries?.length) {
-          result.localStorage![domain] = {};
+          result.localStorage![origin] = {};
           for (const [key, value] of localStorageResponse.entries) {
-            result.localStorage![domain][key] = value;
+            result.localStorage![origin][key] = value;
           }
         }
       } catch (err) {
@@ -120,9 +120,9 @@ export async function extractStorageForPage(
         });
 
         if (sessionStorageResponse?.entries?.length) {
-          result.sessionStorage![domain] = {};
+          result.sessionStorage![origin] = {};
           for (const [key, value] of sessionStorageResponse.entries) {
-            result.sessionStorage![domain][key] = value;
+            result.sessionStorage![origin][key] = value;
           }
         }
       } catch (err) {
@@ -139,7 +139,7 @@ export async function extractStorageForPage(
         const databaseNames = dbResponse?.databaseNames || [];
 
         if (databaseNames.length) {
-          result.indexedDB![domain] = [];
+          result.indexedDB![origin] = [];
 
           // Process each database
           for (let dbIndex = 0; dbIndex < databaseNames.length; dbIndex++) {
@@ -222,7 +222,7 @@ export async function extractStorageForPage(
             }
 
             // Add the database to the result
-            result.indexedDB![domain].push(database);
+            result.indexedDB![origin].push(database);
           }
         }
       } catch (err) {
