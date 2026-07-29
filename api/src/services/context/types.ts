@@ -29,6 +29,7 @@ export interface IndexedDBObjectStore {
 export interface IndexedDBRecord {
   key: any;
   value: any;
+  encoding?: "json_v1";
   blobFiles?: IndexedDBBlobFile[];
 }
 
@@ -124,6 +125,7 @@ export const IndexedDBBlobFileSchema = z.object({
 });
 
 export const IndexedDBRecordSchema = z.object({
+  encoding: z.literal("json_v1").optional(),
   key: z.any(),
   value: z.any(),
   blobFiles: z.array(IndexedDBBlobFileSchema).optional(),
