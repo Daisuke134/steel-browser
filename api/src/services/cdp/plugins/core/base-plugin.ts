@@ -11,6 +11,8 @@ export enum ShutdownReason {
   SESSION_END = "session_end",
   /** Security violation detected (e.g. file:// protocol access) */
   SECURITY_VIOLATION = "security_violation",
+  /** Browser process disconnected outside an owned shutdown */
+  BROWSER_DISCONNECT = "browser_disconnect",
   /** Browser is being relaunched (closing old instance before new launch) */
   RELAUNCH = "relaunch",
   /** Browser launch failed — cleanup before retry */

@@ -1,4 +1,4 @@
-import { Page } from "puppeteer-core";
+import { Page, Protocol } from "puppeteer-core";
 import {
   SessionData,
   IndexedDBDatabase,
@@ -10,6 +10,53 @@ import {
 import { FastifyBaseLogger } from "fastify";
 import { BrowserLauncherOptions } from "../types/index.js";
 import path from "path";
+
+type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
+
+function isJsonValue(value: unknown, depth = 0): value is JsonValue {
+  if (depth > 64) return false;
+  if (value === null || typeof value === "string" || typeof value === "boolean") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (Array.isArray(value)) return value.every((item) => isJsonValue(item, depth + 1));
+  if (
+    typeof value !== "object" ||
+    (Object.getPrototypeOf(value) !== Object.prototype &&
+      Object.getPrototypeOf(value) !== null)
+  ) {
+    return false;
+  }
+  return Object.values(value).every((item) => isJsonValue(item, depth + 1));
+}
+
+function remoteObjectJsonValue(remote: unknown): { value: JsonValue } | null {
+  if (
+    !remote ||
+    typeof remote !== "object" ||
+    Array.isArray(remote) ||
+    Object.prototype.hasOwnProperty.call(remote, "objectId") ||
+    Object.prototype.hasOwnProperty.call(remote, "unserializableValue") ||
+    !Object.prototype.hasOwnProperty.call(remote, "value")
+  ) {
+    return null;
+  }
+  const value = (remote as { value: unknown }).value;
+  return isJsonValue(value) ? { value } : null;
+}
+
+function indexedDbRecordValues(record: IndexedDBRecord): {
+  key: JsonValue;
+  value: JsonValue;
+} | null {
+  if (record.encoding === "json_v1") {
+    return isJsonValue(record.key) && isJsonValue(record.value)
+      ? { key: record.key, value: record.value }
+      : null;
+  }
+  const key = remoteObjectJsonValue(record.key);
+  const value = remoteObjectJsonValue(record.value);
+  return key && value ? { key: key.value, value: value.value } : null;
+}
+
 /**
  * Extract storage data for a single origin
  * @param client CDP session
@@ -56,9 +103,9 @@ export async function extractStorageForPage(
         });
 
         if (localStorageResponse?.entries?.length) {
-          result.localStorage![domain] = {};
+          result.localStorage![origin] = {};
           for (const [key, value] of localStorageResponse.entries) {
-            result.localStorage![domain][key] = value;
+            result.localStorage![origin][key] = value;
           }
         }
       } catch (err) {
@@ -73,9 +120,9 @@ export async function extractStorageForPage(
         });
 
         if (sessionStorageResponse?.entries?.length) {
-          result.sessionStorage![domain] = {};
+          result.sessionStorage![origin] = {};
           for (const [key, value] of sessionStorageResponse.entries) {
-            result.sessionStorage![domain][key] = value;
+            result.sessionStorage![origin][key] = value;
           }
         }
       } catch (err) {
@@ -92,7 +139,7 @@ export async function extractStorageForPage(
         const databaseNames = dbResponse?.databaseNames || [];
 
         if (databaseNames.length) {
-          result.indexedDB![domain] = [];
+          result.indexedDB![origin] = [];
 
           // Process each database
           for (let dbIndex = 0; dbIndex < databaseNames.length; dbIndex++) {
@@ -131,24 +178,33 @@ export async function extractStorageForPage(
               const pageSize = 1000;
 
               while (hasMoreData) {
-                const dataResponse = await client.send("IndexedDB.requestData", {
+                // Chromium rejects `indexName` for an object-store request even though the bundled
+                // protocol type still marks it as required. Keep the wire payload aligned with the
+                // running browser and confine the stale-type escape hatch to this one call.
+                const request = {
                   securityOrigin: origin,
                   databaseName: dbName,
                   objectStoreName: store.name,
-                  indexName: "", // Empty string means use primary key
                   skipCount,
                   pageSize,
-                });
+                } as unknown as Protocol.IndexedDB.RequestDataRequest;
+                const dataResponse = await client.send("IndexedDB.requestData", request);
 
                 // Add the retrieved data
                 const objectStoreData = dataResponse?.objectStoreDataEntries || [];
                 if (objectStoreData.length) {
                   // Map the data to the correct record format
-                  const records: IndexedDBRecord[] = objectStoreData.map((entry) => ({
-                    key: entry.key,
-                    value: entry.value,
-                    // TODO: Add blob files
-                  }));
+                  const records: IndexedDBRecord[] = objectStoreData.flatMap((entry) => {
+                    const key = remoteObjectJsonValue(entry.key);
+                    const value = remoteObjectJsonValue(entry.value);
+                    if (!key || !value) return [];
+                    return [{
+                      encoding: "json_v1" as const,
+                      key: key.value,
+                      value: value.value,
+                      // TODO: Add blob files
+                    }];
+                  });
 
                   objectStore.records.push(...records);
                 }
@@ -166,7 +222,7 @@ export async function extractStorageForPage(
             }
 
             // Add the database to the result
-            result.indexedDB![domain].push(database);
+            result.indexedDB![origin].push(database);
           }
         }
       } catch (err) {
@@ -254,19 +310,12 @@ export const handleFrameNavigated = async (
         for (const store of database.data) {
           if (!store.name || !store.records || store.records.length === 0) continue;
 
-          storeMap[store.name] = store.records.map((record) => {
-            try {
-              // Parse the key and value if they're stored as strings
-              const parsedKey =
-                typeof record.key === "string" ? JSON.parse(record.key) : record.key;
-              const parsedValue =
-                typeof record.value === "string" ? JSON.parse(record.value) : record.value;
-              return { key: parsedKey, value: parsedValue };
-            } catch (e) {
-              // Fall back to original values if parsing fails
-              return { key: record.key, value: record.value };
-            }
-          });
+          const normalizedRecords = store.records
+            .map(indexedDbRecordValues)
+            .filter((record) => record !== null);
+          if (normalizedRecords.length > 0) {
+            storeMap[store.name] = normalizedRecords;
+          }
         }
 
         if (Object.keys(storeMap).length === 0) continue;
@@ -283,7 +332,7 @@ export const handleFrameNavigated = async (
                   // Create object stores from our data
                   for (const storeName of Object.keys(stores)) {
                     if (!db.objectStoreNames.contains(storeName)) {
-                      db.createObjectStore(storeName, { keyPath: "key" });
+                      db.createObjectStore(storeName);
                     }
                   }
                 };
@@ -306,7 +355,7 @@ export const handleFrameNavigated = async (
                     // Add all items
                     for (const item of storeData as any[]) {
                       try {
-                        objectStore.put(item);
+                        objectStore.put(item.value, item.key);
                       } catch (e) {
                         console.error(`Error adding item to IndexedDB: ${e}`);
                       }
