@@ -16,7 +16,7 @@ jobs:
       - name: Check out exact reviewed Steel source
         uses: actions/checkout@v4
         with:
-          ref: bc65f35b1a8548d919520613bde6c8dd5cb4c63b
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -35,7 +35,7 @@ jobs:
           file: ./Dockerfile
           platforms: linux/amd64
           push: true
-          tags: ghcr.io/daisuke134/steel-browser:sha-bc65f35b1a8548d919520613bde6c8dd5cb4c63b
+          tags: ghcr.io/daisuke134/steel-browser:sha-${{ github.event.pull_request.head.sha }}
           labels: |
-            org.opencontainers.image.revision=bc65f35b1a8548d919520613bde6c8dd5cb4c63b
+            org.opencontainers.image.revision=${{ github.event.pull_request.head.sha }}
             org.opencontainers.image.source=https://github.com/Daisuke134/steel-browser
