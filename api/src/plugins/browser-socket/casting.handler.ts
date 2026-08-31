@@ -174,7 +174,7 @@ export async function handleCastSession(
 
     try {
       browser = await puppeteer.connect({
-        browserWSEndpoint: `ws://${env.HOST}:${env.PORT}`,
+        browserWSEndpoint: `ws://${env.HOST.includes(":") ? `[${env.HOST}]` : env.HOST}:${env.PORT}`,
       });
 
       if (!browser) {
